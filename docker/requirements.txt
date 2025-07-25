@@ -1,0 +1,8 @@
+openai-whisper==20230918
+torch==2.0.1
+moviepy==1.0.3
+pandas==2.0.3
+opencv-python-headless==4.8.0.76
+numpy<2
+ffmpeg-python==0.2.0
+mediapipe==0.10.14

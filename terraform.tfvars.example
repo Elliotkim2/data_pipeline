@@ -1,0 +1,35 @@
+# AWS Configuration
+aws_region = "us-east-1"
+# account_id = "123456789012"  # Optional, will be auto-detected
+
+# Project Configuration
+project_name = "ai-training-pipeline"
+environment  = "dev"
+
+# S3 Bucket Names (optional, will be auto-generated if not provided)
+# video_processing_bucket = "my-video-processing-bucket"
+# patients_bucket        = "my-patients-bucket"
+# training_bucket        = "my-training-bucket"
+
+# Lambda Configuration
+file_threshold                 = 10
+size_threshold_mb             = 5
+cooldown_hours                = 1
+lambda_timeout                = 60
+lambda_memory                 = 512
+video_processing_lambda_timeout = 900
+video_processing_lambda_memory  = 3008
+
+# Step Functions Configuration
+training_timeout_minutes = 60
+
+# SageMaker Configuration
+sagemaker_instance_type  = "ml.m5.large"
+sagemaker_instance_count = 1
+
+# Notification Configuration
+notification_email = "your-email@example.com"
+
+# CloudWatch Logs
+enable_cloudwatch_logs = true
+log_retention_days     = 30

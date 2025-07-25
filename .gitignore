@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# AWS
+.aws/
+*.pem
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.log
+/tmp/
+
+# Zip files for Lambda
+*.zip
