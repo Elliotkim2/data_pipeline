@@ -17,11 +17,65 @@ s3_client = boto3.client('s3')
 # Import the processor
 from audio_emotion_extractor_whisper import process_video
 
+
+def get_next_pose_index(bucket, prefix):
+    """
+    Find the highest existing pose index in the given S3 prefix and return the next available index.
+    This prevents overwriting existing pose files when processing new videos.
+    
+    Args:
+        bucket: S3 bucket name
+        prefix: S3 prefix path (e.g., "patient_name/emotion/")
+    
+    Returns:
+        int: The next available index to use for pose files
+    """
+    try:
+        # List all objects in the prefix
+        paginator = s3_client.get_paginator('list_objects_v2')
+        page_iterator = paginator.paginate(
+            Bucket=bucket,
+            Prefix=prefix
+        )
+        
+        max_index = -1
+        
+        # Iterate through all objects to find the highest index
+        for page in page_iterator:
+            if 'Contents' not in page:
+                continue
+                
+            for obj in page['Contents']:
+                key = obj['Key']
+                filename = key.split('/')[-1]
+                
+                # Check if it's a pose file with our naming convention
+                if filename.startswith('pose_') and filename.endswith('.json'):
+                    try:
+                        # Extract the index from pose_XXXXXX.json
+                        index_str = filename[5:11]  # Get the 6 digits
+                        index = int(index_str)
+                        max_index = max(max_index, index)
+                    except (ValueError, IndexError):
+                        # Skip files that don't match our expected format
+                        continue
+        
+        # Return the next available index
+        next_index = max_index + 1
+        logger.info(f"Found {max_index + 1} existing pose files in {prefix}, starting at index {next_index}")
+        return next_index
+        
+    except Exception as e:
+        logger.warning(f"Error checking existing pose files in {prefix}: {e}")
+        # If there's an error, start from 0 (but log the warning)
+        return 0
+
+
 def lambda_handler(event, context):
     """
     Lambda function triggered by S3 event when a video is uploaded.
     Downloads the video, processes it with emotion analysis and pose extraction, 
-    and uploads results back to S3.
+    and uploads results back to S3 with cumulative indexing to prevent overwrites.
     
     Expected S3 structure:
     Input: patient-name/video-file.mp4
@@ -83,17 +137,16 @@ def lambda_handler(event, context):
                         
                         # Process video with emotion analysis
                         logger.info("Processing video with emotion analysis and pose extraction...")
-                        result               = process_video(tmp_input.name, tmp_output.name)
-                        annotated_video_path = result['output_path']
-                        frame_files          = result.get('frame_files', [])
-                        pose_files           = result.get('pose_files', [])
-                        metadata             = result.get('metadata', {})
                         result = process_video(tmp_input.name, tmp_output.name)
                         logger.info(f"process_video returned type: {type(result)}")
                         logger.info(f"result keys: {result.keys() if isinstance(result, dict) else 'not a dict'}")
 
                         annotated_video_path = result['output_path']
                         logger.info(f"annotated_video_path type: {type(annotated_video_path)}, value: {annotated_video_path}")
+                        
+                        # Get metadata for emotion detection
+                        metadata = result.get('metadata', {})
+                        
                         # Create output key maintaining patient folder structure
                         output_key = f"annotated/{key}"
                         
@@ -175,7 +228,7 @@ def lambda_handler(event, context):
                             except Exception as e:
                                 logger.error(f"Error processing frame files: {e}")
                         
-                        # Upload extracted poses if they exist
+                        # Upload extracted poses with CUMULATIVE INDEXING
                         if 'POSE_FILES' in os.environ and os.environ['POSE_FILES'].strip():
                             try:
                                 pose_files = json.loads(os.environ['POSE_FILES'])
@@ -203,12 +256,18 @@ def lambda_handler(event, context):
                                 # Map to training bucket format
                                 emotion_dir = emotion_mapping.get(dominant_emotion, dominant_emotion)
                                 
-                                # Upload poses to BOTH locations
+                                # === CUMULATIVE INDEXING FIX ===
+                                # Get the next available index for this patient/emotion combination
+                                training_prefix = f"{patient_name}/{emotion_dir}/"
+                                start_index = get_next_pose_index('patients999', training_prefix)
+                                logger.info(f"Starting pose upload at index {start_index} for {training_prefix}")
+                                
+                                # Upload poses to BOTH locations with proper indexing
                                 pose_upload_count = 0
                                 for i, (pose_path, pose_filename) in enumerate(pose_files):
                                     if os.path.exists(pose_path):
                                         try:
-                                            # Upload to annotated bucket for reference
+                                            # Upload to annotated bucket for reference (keep original naming)
                                             annotated_pose_key = f"annotated/{patient_name}/poses/{video_basename}/{pose_filename}"
                                             s3_client.upload_file(
                                                 pose_path,
@@ -218,15 +277,16 @@ def lambda_handler(event, context):
                                             )
                                             logger.info(f"Uploaded pose to annotated: {annotated_pose_key}")
                                             
-                                            # Upload to training bucket in correct format
-                                            training_pose_key = f"{patient_name}/{emotion_dir}/pose_{i:06d}.json"
+                                            # Upload to training bucket with CUMULATIVE index
+                                            cumulative_index = start_index + i
+                                            training_pose_key = f"{patient_name}/{emotion_dir}/pose_{cumulative_index:06d}.json"
                                             s3_client.upload_file(
                                                 pose_path,
                                                 'patients999',  # Training bucket
                                                 training_pose_key,
                                                 ExtraArgs={'ContentType': 'application/json'}
                                             )
-                                            logger.info(f"Uploaded pose to training: {training_pose_key}")
+                                            logger.info(f"Uploaded pose to training with cumulative index: {training_pose_key}")
                                             pose_upload_count += 1
                                             
                                         except Exception as e:
@@ -234,7 +294,28 @@ def lambda_handler(event, context):
                                     else:
                                         logger.warning(f"Pose file not found: {pose_path}")
                                 
-                                logger.info(f"Successfully uploaded {pose_upload_count} pose files")
+                                logger.info(f"Successfully uploaded {pose_upload_count} pose files (indices {start_index} to {start_index + pose_upload_count - 1})")
+                                
+                                # Add session metadata to track which poses came from which video
+                                session_metadata = {
+                                    'video_file': key,
+                                    'processing_time': result.get('metadata', {}).get('processing_time', 'unknown'),
+                                    'emotion': emotion_dir,
+                                    'pose_indices': {
+                                        'start': start_index,
+                                        'end': start_index + pose_upload_count - 1,
+                                        'count': pose_upload_count
+                                    }
+                                }
+                                
+                                session_key = f"{patient_name}/{emotion_dir}/.sessions/{video_basename}_session.json"
+                                s3_client.put_object(
+                                    Bucket='patients999',
+                                    Key=session_key,
+                                    Body=json.dumps(session_metadata, indent=2),
+                                    ContentType='application/json'
+                                )
+                                logger.info(f"Saved session metadata to: {session_key}")
                                 
                                 # Clean up environment variable
                                 del os.environ['POSE_FILES']
