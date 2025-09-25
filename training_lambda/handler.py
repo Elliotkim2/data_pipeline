@@ -12,6 +12,28 @@ sagemaker = boto3.client('sagemaker')
 MODEL_BUCKET = os.environ.get('MODEL_BUCKET', 'patients999')
 SAGEMAKER_ROLE_ARN = os.environ.get('SAGEMAKER_ROLE_ARN', 'arn:aws:iam::443293291738:role/ai-training-pipeline-sagemaker-role')
 
+def get_local_file_content(filename):
+    """Read file from Lambda package"""
+    try:
+        with open(filename, 'rb') as f:
+            return f.read()
+    except Exception as e:
+        print(f"Error reading {filename}: {e}")
+        return get_placeholder_content(filename)
+    
+def get_actual_file_from_s3(filename):
+    """Get actual training file from S3"""
+    try:
+        response = s3.get_object(
+            Bucket='patients999',
+            Key=f'source-code/{filename}'
+        )
+        return response['Body'].read()
+    except Exception as e:
+        print(f"Error reading {filename} from S3: {e}")
+        # Fallback to placeholder if file not found
+        return get_placeholder_content(filename)
+
 def handler(event, context):
     """Handler that starts SageMaker training with real training scripts"""
     print(f"Received event: {json.dumps(event)}")
@@ -126,9 +148,9 @@ def upload_training_code(s3_path):
     with tarfile.open(fileobj=tar_buffer, mode='w:gz') as tar:
         # Add all the training files
         files_to_add = {
-            'train_sagemaker.py': get_train_sagemaker_content(),
-            'train.py': get_placeholder_content('train.py'),  # Should be your real train.py
-            'extract.py': get_placeholder_content('extract.py'),  # Should be your real extract.py
+            'train_sagemaker.py': get_actual_file_from_s3('train_sagemaker.py'),
+            'train.py': get_actual_file_from_s3('train.py'),
+            'extract.py': get_actual_file_from_s3('extract.py'),  # Should be your real extract.py
             'requirements.txt': get_requirements_content()
         }
         
@@ -145,93 +167,6 @@ def upload_training_code(s3_path):
     s3.put_object(Bucket=bucket, Key=key, Body=tar_buffer.getvalue())
     print(f"Training code uploaded to {s3_path}")
 
-def get_train_sagemaker_content():
-    """The wrapper script that SageMaker will run"""
-    return b'''#!/usr/bin/env python
-import os
-import sys
-import subprocess
-import shutil
-
-def setup_training_data():
-    """Reorganize training data if needed"""
-    train_dir = '/opt/ml/input/data/train'
-    print(f"Training data directory: {train_dir}")
-    print(f"Contents: {os.listdir(train_dir)}")
-    
-    # Check if we need to move emotion directories up
-    for item in os.listdir(train_dir):
-        item_path = os.path.join(train_dir, item)
-        if os.path.isdir(item_path):
-            subdirs = os.listdir(item_path)
-            emotions = ['happiness', 'sadness', 'anger', 'disgust', 'fear', 'neutral', 'surprise']
-            has_emotion_dirs = any(subdir.lower() in emotions for subdir in subdirs)
-            
-            if has_emotion_dirs:
-                print(f"Moving emotion directories from {item_path} to {train_dir}")
-                for subdir in subdirs:
-                    src = os.path.join(item_path, subdir)
-                    dst = os.path.join(train_dir, subdir)
-                    if os.path.isdir(src) and not os.path.exists(dst):
-                        shutil.move(src, dst)
-                try:
-                    os.rmdir(item_path)
-                except:
-                    pass
-    
-    print(f"Final training directory contents: {os.listdir(train_dir)}")
-
-def main():
-    model_dir = os.environ.get('SM_MODEL_DIR', '/opt/ml/model')
-    train_dir = os.environ.get('SM_CHANNEL_TRAIN', '/opt/ml/input/data/train')
-    output_dir = os.environ.get('SM_OUTPUT_DATA_DIR', '/opt/ml/output/data')
-    
-    print(f"Model dir: {model_dir}")
-    print(f"Train dir: {train_dir}")
-    print(f"Output dir: {output_dir}")
-    
-    # Reorganize data if needed
-    setup_training_data()
-    
-    # Install requirements
-    print("Installing requirements...")
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'])
-    
-    # Run the actual training script
-    print("Running train.py...")
-    result = subprocess.run([
-        sys.executable, 'train.py',
-        '--data_dir', train_dir,
-        '--output_dir', model_dir,
-        '--force_extract'  # Force feature extraction
-    ], capture_output=True, text=True)
-    
-    print("STDOUT:", result.stdout)
-    print("STDERR:", result.stderr)
-    
-    if result.returncode != 0:
-        print(f"Training script failed with return code {result.returncode}")
-    
-    # Ensure we have a model file
-    model_file = os.path.join(model_dir, 'advanced_emotion_model.pkl')
-    if not os.path.exists(model_file):
-        print("Warning: Model file not found after training")
-        # Create a minimal file so SageMaker doesn't fail
-        with open(model_file, 'w') as f:
-            f.write("Training incomplete - check logs")
-    else:
-        print(f"Model saved successfully: {model_file}")
-    
-    # List all outputs
-    for root, dirs, files in os.walk(model_dir):
-        for file in files:
-            print(f"Output file: {os.path.join(root, file)}")
-    
-    print("Training completed!")
-
-if __name__ == "__main__":
-    main()
-'''
 
 def get_requirements_content():
     """Requirements for the training environment"""
