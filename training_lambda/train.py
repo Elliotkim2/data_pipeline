@@ -1,3 +1,8 @@
+# training_lambda/train.py - SESSION-BASED VERSION
+"""
+This version creates multiple training samples from pose directories
+by using the .sessions metadata to split poses by video source
+"""
 import os
 import sys
 import numpy as np
@@ -13,33 +18,135 @@ from tqdm import tqdm
 import seaborn as sns
 import argparse
 
-# Import our PoseFeatureExtractor class
-# This is from the previous code sample - make sure it's in a file called pose_feature_extractor.py
 from extract import PoseFeatureExtractor
 
 # Constants
 EMOTIONS = ['Anger', 'Disgust', 'Fear', 'Happiness', 'Neutral', 'Sadness', 'Surprise']
 
-def find_json_directories(data_dir):
+# Minimum samples required for training
+MIN_SAMPLES_PER_CLASS = 3
+MIN_TOTAL_SAMPLES = 10
+
+def load_session_metadata(emotion_dir):
     """
-    Find directories containing JSON files with pose data
+    Load session metadata to map pose files to video sources
+    
+    Args:
+        emotion_dir: Directory containing pose files and .sessions folder
+        
+    Returns:
+        Dictionary mapping pose indices to session info
+    """
+    sessions_dir = os.path.join(emotion_dir, '.sessions')
+    session_map = {}
+    
+    if not os.path.exists(sessions_dir):
+        print(f"No .sessions directory found in {emotion_dir}")
+        return None
+    
+    # Load all session files
+    session_files = [f for f in os.listdir(sessions_dir) if f.endswith('_session.json')]
+    
+    for session_file in session_files:
+        session_path = os.path.join(sessions_dir, session_file)
+        try:
+            with open(session_path, 'r') as f:
+                session_data = json.load(f)
+            
+            # Extract video file name (without extension) as session ID
+            video_file = session_data.get('video_file', '')
+            session_id = os.path.splitext(os.path.basename(video_file))[0]
+            
+            # Get pose index range for this session
+            indices = session_data.get('pose_indices', {})
+            start_idx = indices.get('start', 0)
+            end_idx = indices.get('end', 0)
+            
+            # Map each pose index to this session
+            for idx in range(start_idx, end_idx + 1):
+                pose_filename = f"pose_{idx:06d}.json"
+                session_map[pose_filename] = {
+                    'session_id': session_id,
+                    'video_file': video_file,
+                    'emotion': session_data.get('emotion', 'unknown')
+                }
+        
+        except Exception as e:
+            print(f"Error loading session file {session_file}: {e}")
+    
+    return session_map
+
+def group_poses_by_session(emotion_dir, session_map):
+    """
+    Group pose files by their source video session
+    
+    Args:
+        emotion_dir: Directory containing pose files
+        session_map: Mapping from pose files to sessions
+        
+    Returns:
+        Dictionary of session_id -> list of pose file paths
+    """
+    if session_map is None:
+        # Fallback: treat all poses as one session
+        pose_files = [f for f in os.listdir(emotion_dir) 
+                     if f.endswith('.json') and not f.startswith('.')]
+        return {'default': [os.path.join(emotion_dir, f) for f in sorted(pose_files)]}
+    
+    sessions = {}
+    
+    # Group pose files by session
+    for pose_file in os.listdir(emotion_dir):
+        if not pose_file.endswith('.json') or pose_file.startswith('.'):
+            continue
+        
+        # Check if this pose belongs to a tracked session
+        if pose_file in session_map:
+            session_info = session_map[pose_file]
+            session_id = session_info['session_id']
+            
+            if session_id not in sessions:
+                sessions[session_id] = []
+            
+            sessions[session_id].append(os.path.join(emotion_dir, pose_file))
+        else:
+            # Orphaned pose file (no session metadata)
+            if 'untracked' not in sessions:
+                sessions['untracked'] = []
+            sessions['untracked'].append(os.path.join(emotion_dir, pose_file))
+    
+    # Sort pose files within each session
+    for session_id in sessions:
+        sessions[session_id].sort()
+    
+    return sessions
+
+def find_emotion_directories(data_dir):
+    """
+    Find emotion directories (e.g., happiness, sadness)
     
     Args:
         data_dir: Root data directory
         
     Returns:
-        List of directories containing JSON files
+        List of (emotion_dir_path, emotion_name) tuples
     """
-    json_dirs = []
+    emotion_dirs = []
     
-    # Walk through the data directory
-    for root, dirs, files in os.walk(data_dir):
-        # Check if this directory contains JSON files
-        json_files = [f for f in files if f.endswith('.json')]
-        if json_files:
-            json_dirs.append(root)
+    # Look for emotion directories directly under data_dir
+    for item in os.listdir(data_dir):
+        item_path = os.path.join(data_dir, item)
+        
+        # Skip hidden directories and files
+        if item.startswith('.') or not os.path.isdir(item_path):
+            continue
+        
+        # Check if directory name matches an emotion
+        emotion = determine_emotion_from_path(item_path)
+        if emotion:
+            emotion_dirs.append((item_path, emotion))
     
-    return json_dirs
+    return emotion_dirs
 
 def determine_emotion_from_path(path):
     """
@@ -58,81 +165,167 @@ def determine_emotion_from_path(path):
         if emotion.lower() in path_lower:
             return emotion
     
-    # Check for emotion codes in the path
-    emotion_codes = {
-        'A': 'Anger',
-        'D': 'Disgust',
-        'F': 'Fear',
-        'H': 'Happiness',
-        'N': 'Neutral',
-        'SA': 'Sadness',
-        'SU': 'Surprise'
-    }
-    
-    for code, emotion in emotion_codes.items():
-        # Check for code with word boundaries or surrounded by non-alphanumeric
-        if f"_{code}" in path or f"{code}_" in path or f"{code}0" in path or f"{code}1" in path or f"{code}2" in path:
-            return emotion
-    
     return None
 
-def extract_features_from_directories(json_dirs, feature_extractor):
+def extract_features_from_sessions(emotion_dirs, feature_extractor):
     """
-    Extract features from directories containing JSON files
+    Extract features from pose data grouped by video session
+    Creates one training sample per video session
     
     Args:
-        json_dirs: List of directories containing JSON files
+        emotion_dirs: List of (emotion_dir_path, emotion_name) tuples
         feature_extractor: PoseFeatureExtractor instance
         
     Returns:
-        Features and labels
+        Features, labels, and session info
     """
     features = []
     labels = []
-    valid_dirs = []
+    session_info = []
     
-    print(f"Extracting features from {len(json_dirs)} directories...")
+    print(f"Processing {len(emotion_dirs)} emotion directories...")
     
-    # First, determine emotions from paths
-    for json_dir in json_dirs:
-        emotion = determine_emotion_from_path(json_dir)
-        if emotion:
-            valid_dirs.append((json_dir, emotion))
-    
-    print(f"Found {len(valid_dirs)} valid directories with identifiable emotions")
-    
-    # Extract features from each directory with a progress bar
-    for json_dir, emotion in tqdm(valid_dirs, desc="Extracting features"):
-        try:
-            # Extract features from JSON files
-            dir_features = feature_extractor.extract_features_from_json_files(json_dir)
+    for emotion_dir, emotion in emotion_dirs:
+        print(f"\nProcessing {emotion} from {emotion_dir}")
+        
+        # Load session metadata
+        session_map = load_session_metadata(emotion_dir)
+        
+        # Group poses by session
+        sessions = group_poses_by_session(emotion_dir, session_map)
+        
+        print(f"Found {len(sessions)} sessions with poses:")
+        for session_id, pose_files in sessions.items():
+            print(f"  - {session_id}: {len(pose_files)} poses")
+        
+        # Extract features for each session separately
+        for session_id, pose_files in tqdm(sessions.items(), desc=f"Extracting {emotion}"):
+            if len(pose_files) < 5:  # Skip sessions with very few poses
+                print(f"  Skipping {session_id}: only {len(pose_files)} poses (need at least 5)")
+                continue
             
-            if dir_features is not None and len(dir_features) > 0:
-                features.append(dir_features)
-                labels.append(emotion)
-        except Exception as e:
-            print(f"Error extracting features from {json_dir}: {e}")
+            try:
+                # Extract features from this session's poses
+                session_features = extract_features_from_pose_files(pose_files, feature_extractor)
+                
+                if session_features is not None and len(session_features) > 0:
+                    features.append(session_features)
+                    labels.append(emotion)
+                    session_info.append({
+                        'session_id': session_id,
+                        'emotion': emotion,
+                        'num_poses': len(pose_files)
+                    })
+            
+            except Exception as e:
+                print(f"  Error extracting features from session {session_id}: {e}")
     
     if not features:
-        print("No valid features extracted from any directory")
-        return None, None
+        print("\n❌ No valid features extracted from any session")
+        return None, None, None
     
     # Convert to numpy arrays
     features = np.array(features)
     labels = np.array(labels)
     
-    print(f"Extracted {features.shape[1]} features from {len(labels)} recordings")
-    print(f"Emotion distribution: {pd.Series(labels).value_counts().to_dict()}")
+    print(f"\n📊 Feature Extraction Summary:")
+    print(f"Extracted {features.shape[1]} features from {len(labels)} video sessions")
     
-    return features, labels
+    # Print session distribution
+    emotion_counts = pd.Series(labels).value_counts()
+    print(f"\nSessions per emotion:")
+    for emotion, count in emotion_counts.items():
+        print(f"  {emotion}: {count} sessions")
+    
+    # Print detailed session info
+    print(f"\nDetailed session breakdown:")
+    for info in session_info:
+        print(f"  {info['session_id']} ({info['emotion']}): {info['num_poses']} poses")
+    
+    return features, labels, session_info
 
-def train_emotion_model(features, labels, model_path, output_dir=None):
+def extract_features_from_pose_files(pose_files, feature_extractor):
     """
-    Train an emotion classification model with advanced features
+    Extract features from a list of pose JSON files
+    
+    Args:
+        pose_files: List of pose file paths
+        feature_extractor: PoseFeatureExtractor instance
+        
+    Returns:
+        Extracted features
+    """
+    pose_frames = []
+    
+    for pose_file in pose_files:
+        try:
+            with open(pose_file, 'r') as f:
+                data = json.load(f)
+            
+            # Extract keypoints (OpenPose format)
+            keypoints = None
+            
+            if 'people' in data and len(data['people']) > 0:
+                if 'pose_keypoints_2d' in data['people'][0]:
+                    flat_keypoints = data['people'][0]['pose_keypoints_2d']
+                    keypoints = np.array(flat_keypoints).reshape(-1, 3)  # [keypoints, 3]
+            
+            if keypoints is not None:
+                pose_frames.append(keypoints)
+        
+        except Exception as e:
+            print(f"Error loading {pose_file}: {e}")
+    
+    if not pose_frames:
+        return None
+    
+    # Convert to numpy array
+    pose_frames = np.array(pose_frames)
+    
+    # Extract features from the sequence of poses
+    features = feature_extractor.extract_features_from_pose_sequence(pose_frames)
+    
+    return features
+
+def validate_training_data(labels):
+    """
+    Validate that we have enough data to train
+    
+    Args:
+        labels: Array of emotion labels
+        
+    Returns:
+        (is_valid, error_message)
+    """
+    if labels is None or len(labels) == 0:
+        return False, "No training data available"
+    
+    # Check total samples
+    if len(labels) < MIN_TOTAL_SAMPLES:
+        return False, f"Need at least {MIN_TOTAL_SAMPLES} total samples (video sessions), got {len(labels)}"
+    
+    # Check samples per class
+    emotion_counts = pd.Series(labels).value_counts()
+    min_class_count = emotion_counts.min()
+    
+    if min_class_count < MIN_SAMPLES_PER_CLASS:
+        insufficient_classes = [
+            f"{emotion} ({count})" 
+            for emotion, count in emotion_counts.items() 
+            if count < MIN_SAMPLES_PER_CLASS
+        ]
+        return False, f"Need at least {MIN_SAMPLES_PER_CLASS} samples per class. Insufficient: {', '.join(insufficient_classes)}"
+    
+    return True, None
+
+def train_emotion_model(features, labels, session_info, model_path, output_dir=None):
+    """
+    Train an emotion classification model
     
     Args:
         features: Extracted features
         labels: Emotion labels
+        session_info: Information about training sessions
         model_path: Path to save the model
         output_dir: Directory to save visualizations
         
@@ -143,20 +336,24 @@ def train_emotion_model(features, labels, model_path, output_dir=None):
         print("Error: Features or labels are None")
         return None, None, None
     
-    if len(features) == 0:
-        print("Error: No features to train on")
+    # Validate training data
+    is_valid, error_msg = validate_training_data(labels)
+    if not is_valid:
+        print(f"\n❌ Training data validation failed: {error_msg}")
+        print("\nYou need to upload more videos. Each video becomes one training sample.")
+        print(f"Current: {len(labels)} video sessions")
+        print(f"Required: {MIN_TOTAL_SAMPLES} total, {MIN_SAMPLES_PER_CLASS} per emotion")
         return None, None, None
     
     try:
+        print("\n✅ Training data validation passed!")
         print("Training emotion model...")
         
         # Encode labels
         label_encoder = LabelEncoder()
         labels_encoded = label_encoder.fit_transform(labels)
         
-        # Print label mapping
-        label_mapping = {emotion: i for i, emotion in enumerate(label_encoder.classes_)}
-        print(f"Label mapping: {label_mapping}")
+        print(f"Label mapping: {dict(enumerate(label_encoder.classes_))}")
         
         # Scale features
         scaler = StandardScaler()
@@ -164,41 +361,44 @@ def train_emotion_model(features, labels, model_path, output_dir=None):
         
         # Split into training and testing sets
         X_train, X_test, y_train, y_test = train_test_split(
-            features_scaled, labels_encoded, test_size=0.2, random_state=42, stratify=labels_encoded
+            features_scaled, labels_encoded, 
+            test_size=0.2, 
+            random_state=42, 
+            stratify=labels_encoded
         )
         
         print(f"Training on {X_train.shape[0]} samples, testing on {X_test.shape[0]} samples")
         
-        # Try cross-validation first to estimate model performance
+        # Cross-validation
         print("Performing cross-validation...")
         model = RandomForestClassifier(n_estimators=100, random_state=42)
-        cv_scores = cross_val_score(model, X_train, y_train, cv=5)
+        cv_scores = cross_val_score(model, X_train, y_train, cv=min(5, len(np.unique(y_train))))
         print(f"Cross-validation scores: {cv_scores}")
         print(f"Mean CV score: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
         
-        # Train the final model on all training data
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        # Train final model
         model.fit(X_train, y_train)
         
-        # Evaluate on test set
+        # Evaluate
         train_accuracy = model.score(X_train, y_train)
         test_accuracy = model.score(X_test, y_test)
         
+        print(f"\n📊 Model Performance:")
         print(f"Training accuracy: {train_accuracy:.4f}")
         print(f"Testing accuracy: {test_accuracy:.4f}")
         
-        # Detailed classification report
+        # Classification report
         y_pred = model.predict(X_test)
         print("\nClassification Report:")
-        print(classification_report(y_test, y_pred, target_names=label_encoder.classes_))
+        print(classification_report(y_test, y_pred, target_names=label_encoder.classes_, zero_division=0))
         
-        # Create output directory if provided
+        # Save visualizations
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             
-            # Create confusion matrix visualization
+            # Confusion matrix
             cm = confusion_matrix(y_test, y_pred)
-            cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+            cm_normalized = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-10)
             
             plt.figure(figsize=(10, 8))
             sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
@@ -207,163 +407,92 @@ def train_emotion_model(features, labels, model_path, output_dir=None):
             plt.xlabel('Predicted')
             plt.ylabel('True')
             plt.title('Confusion Matrix')
-            
-            # Save the plot
-            cm_path = os.path.join(output_dir, 'confusion_matrix.png')
-            plt.savefig(cm_path)
+            plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'))
             plt.close()
             
-            print(f"Confusion matrix saved to {cm_path}")
-            
-            # Create feature importance visualization
-            feature_importances = model.feature_importances_
-            
-            # Sort features by importance
-            indices = np.argsort(feature_importances)[-20:]  # Top 20 features
+            # Feature importance
+            importances = model.feature_importances_
+            indices = np.argsort(importances)[-20:]
             
             plt.figure(figsize=(12, 8))
-            plt.barh(range(len(indices)), feature_importances[indices])
+            plt.barh(range(len(indices)), importances[indices])
             plt.yticks(range(len(indices)), [f"Feature {i}" for i in indices])
             plt.xlabel('Importance')
             plt.title('Top 20 Feature Importances')
-            
-            # Save the plot
-            fi_path = os.path.join(output_dir, 'feature_importance.png')
-            plt.savefig(fi_path)
+            plt.savefig(os.path.join(output_dir, 'feature_importance.png'))
             plt.close()
-            
-            print(f"Feature importance plot saved to {fi_path}")
         
-        # Create the model directory if it doesn't exist
+        # Save model
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        
-        # Save the model, scaler, and encoder
         with open(model_path, 'wb') as f:
             pickle.dump((model, scaler, label_encoder), f)
         
-        print(f"Model saved to {model_path}")
+        # Save session info
+        session_info_path = os.path.join(output_dir or os.path.dirname(model_path), 'training_sessions.json')
+        with open(session_info_path, 'w') as f:
+            json.dump(session_info, f, indent=2)
+        
+        print(f"\n✅ Model saved to {model_path}")
+        print(f"✅ Session info saved to {session_info_path}")
         
         return model, scaler, label_encoder
     
     except Exception as e:
-        print(f"Error training model: {e}")
+        print(f"❌ Error training model: {e}")
         import traceback
         traceback.print_exc()
         return None, None, None
 
-def load_csv_data(csv_path):
-    """
-    Load data from CSV file if available
-    
-    Args:
-        csv_path: Path to CSV file
-        
-    Returns:
-        Features and labels
-    """
-    try:
-        print(f"Loading data from CSV file: {csv_path}")
-        df = pd.read_csv(csv_path)
-        
-        print(f"Loaded CSV with {len(df)} rows and {len(df.columns)} columns")
-        print(f"Columns: {df.columns.tolist()}")
-        
-        # Check if we have emotion labels
-        if 'emotion' in df.columns:
-            labels = df['emotion'].values
-            print(f"Found emotion labels: {np.unique(labels)}")
-            
-            # Check if we have advanced features
-            feature_cols = [col for col in df.columns if col.startswith('feature_')]
-            
-            if feature_cols:
-                print(f"Found {len(feature_cols)} feature columns")
-                features = df[feature_cols].values
-                
-                return features, labels
-        
-        print("CSV does not contain expected advanced features and labels")
-        return None, None
-    
-    except Exception as e:
-        print(f"Error loading CSV data: {e}")
-        return None, None
-
-def save_features_to_csv(features, labels, output_path):
-    """
-    Save extracted features to CSV file
-    
-    Args:
-        features: Extracted features
-        labels: Emotion labels
-        output_path: Path to save CSV file
-    """
-    try:
-        # Create DataFrame with features
-        feature_cols = [f"feature_{i}" for i in range(features.shape[1])]
-        df = pd.DataFrame(features, columns=feature_cols)
-        
-        # Add label column
-        df['emotion'] = labels
-        
-        # Save to CSV
-        df.to_csv(output_path, index=False)
-        
-        print(f"Features saved to {output_path}")
-    
-    except Exception as e:
-        print(f"Error saving features to CSV: {e}")
-
 def main():
-    parser = argparse.ArgumentParser(description='Train emotion recognition model with advanced pose features')
-    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing pose data')
-    parser.add_argument('--output_dir', type=str, required=True, help='Output directory for model and visualizations')
-    parser.add_argument('--force_extract', action='store_true', help='Force feature extraction even if CSV exists')
+    parser = argparse.ArgumentParser(description='Train emotion recognition model with session-based samples')
+    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing emotion subdirectories')
+    parser.add_argument('--output_dir', type=str, required=True, help='Output directory for model')
     
     args = parser.parse_args()
     
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Define paths
     model_path = os.path.join(args.output_dir, 'advanced_emotion_model.pkl')
-    features_csv_path = os.path.join(args.output_dir, 'advanced_features.csv')
     
-    # Check if we already have extracted features
-    features = None
-    labels = None
+    print("="*60)
+    print("SESSION-BASED EMOTION RECOGNITION TRAINING")
+    print("="*60)
+    print(f"Data directory: {args.data_dir}")
+    print(f"Output directory: {args.output_dir}")
+    print()
     
-    if os.path.exists(features_csv_path) and not args.force_extract:
-        print(f"Found existing features file: {features_csv_path}")
-        features, labels = load_csv_data(features_csv_path)
+    # Initialize feature extractor
+    feature_extractor = PoseFeatureExtractor()
     
-    # If no existing features or force_extract, extract new features
-    if features is None or labels is None or args.force_extract:
-        print("Extracting new features...")
-        
-        # Initialize feature extractor
-        feature_extractor = PoseFeatureExtractor()
-        
-        # Find directories with JSON files
-        json_dirs = find_json_directories(args.data_dir)
-        print(f"Found {len(json_dirs)} directories with JSON files")
-        
-        if not json_dirs:
-            print(f"Error: No directories with JSON files found in {args.data_dir}")
-            return
-        
-        # Extract features
-        features, labels = extract_features_from_directories(json_dirs, feature_extractor)
-        
-        if features is not None and labels is not None:
-            # Save features to CSV for future use
-            save_features_to_csv(features, labels, features_csv_path)
+    # Find emotion directories
+    emotion_dirs = find_emotion_directories(args.data_dir)
+    
+    if not emotion_dirs:
+        print(f"❌ No emotion directories found in {args.data_dir}")
+        sys.exit(1)
+    
+    print(f"Found {len(emotion_dirs)} emotion directories:")
+    for dir_path, emotion in emotion_dirs:
+        print(f"  - {emotion}: {dir_path}")
+    print()
+    
+    # Extract features (one sample per video session)
+    features, labels, session_info = extract_features_from_sessions(emotion_dirs, feature_extractor)
     
     # Train model
     if features is not None and labels is not None:
-        train_emotion_model(features, labels, model_path, args.output_dir)
+        result = train_emotion_model(features, labels, session_info, model_path, args.output_dir)
+        
+        if result == (None, None, None):
+            print("\n❌ Training failed")
+            print("\n💡 Tip: Upload more videos. Each video = 1 training sample")
+            print(f"   Need: {MIN_TOTAL_SAMPLES} total videos, {MIN_SAMPLES_PER_CLASS} per emotion")
+            sys.exit(1)
+        else:
+            print("\n🎉 Training completed successfully!")
     else:
-        print("Error: Could not extract or load features and labels")
+        print("❌ Could not extract features")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
