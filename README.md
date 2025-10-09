@@ -189,7 +189,7 @@ aws configure
 ### 3. Build Docker Image
 ```bash
 cd docker
-docker build -t voice-video-processor .
+docker buildx build --platform linux/amd64 --load -t whisper-lambda-with-pose .   
 ```
 
 ### 4. Push to ECR
@@ -201,8 +201,9 @@ aws ecr create-repository --repository-name voice-video-processor
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
 
 # Tag and push
-docker tag voice-video-processor:latest <account-id>.dkr.ecr.us-east-1.amazonaws.com/voice-video-processor:latest
-docker push <account-id>.dkr.ecr.us-east-1.amazonaws.com/voice-video-processor:latest
+docker tag whisper-lambda-with-pose:latest \                                                                
+    ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}
+docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}:${IMAGE_TAG}
 ```
 
 ### 5. Deploy Infrastructure
