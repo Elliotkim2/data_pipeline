@@ -96,11 +96,11 @@ def main():
         if result.returncode != 0:
             print(f"Training script failed with return code {result.returncode}")
             print("Creating fallback model...")
-            create_minimal_working_model(model_dir)
+            return
         elif not os.path.exists(model_file):
             print("Warning: Model file not found after training")
             print("Creating fallback model...")
-            create_minimal_working_model(model_dir)
+            return
         else:
             # Verify the model file is valid
             try:
@@ -110,8 +110,7 @@ def main():
             except Exception as e:
                 print(f"Model file is corrupted: {e}")
                 print("Creating fallback model...")
-                create_minimal_working_model(model_dir)
-        
+                return
         # List final outputs
         print("Final model directory contents:")
         for item in os.listdir(model_dir):
@@ -124,7 +123,7 @@ def main():
     except Exception as e:
         print(f"Training failed with error: {str(e)}")
         print("Creating emergency fallback model...")
-        create_minimal_working_model(model_dir)
+        return
         # Don't raise exception - let SageMaker complete
 
 if __name__ == "__main__":
