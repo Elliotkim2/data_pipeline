@@ -283,7 +283,7 @@ s3://patients999/
 #### CloudWatch Logs
 ```bash
 # Video processor logs
-aws logs tail /aws/lambda/voice-video-processor-dev --follow
+aws logs tail /aws/lambda/video-annotation-processor-whisper --follow
 
 # Training logs
 aws logs tail /aws/stepfunctions/voice-training-pipeline-dev --follow
