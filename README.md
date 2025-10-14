@@ -411,6 +411,139 @@ Feature Engineering:
 
 ---
 
+## Training Validation
+
+### Check Training Status
+
+**View Recent Training Jobs:**
+```bash
+aws sagemaker list-training-jobs \
+  --name-contains emotion-Elliot \
+  --sort-by CreationTime \
+  --sort-order Descending \
+  --max-results 5 \
+  --query 'TrainingJobSummaries[*].[TrainingJobName,TrainingJobStatus,CreationTime]' \
+  --output table
+```
+
+**Get Training Job Details:**
+```bash
+aws sagemaker describe-training-job \
+  --training-job-name emotion-Elliot-TIMESTAMP
+```
+
+**Download Model Artifacts:**
+```bash
+# Model is saved to S3 after training
+aws s3 cp s3://patients999/models/Elliot/model.tar.gz .
+tar -xzf model.tar.gz
+```
+
+### Verify Model Quality
+
+**Check Training Metrics:**
+- Training Accuracy: Should be >80% for good model
+- Test Accuracy: Should be >60% with sufficient data
+- CV Score: Should be >70% with 20+ samples per class
+
+**Review Visualizations:**
+```bash
+# Download confusion matrix and feature importance plots
+aws s3 cp s3://patients999/models/Elliot/confusion_matrix.png .
+aws s3 cp s3://patients999/models/Elliot/feature_importance.png .
+```
+
+**Session Metadata:**
+```bash
+# Check which videos were used for training
+aws s3 cp s3://patients999/models/Elliot/training_sessions.json - | jq .
+```
+
+### Monitor Training Logs
+
+**CloudWatch Logs:**
+```bash
+# Training logs (SageMaker)
+aws logs tail /aws/sagemaker/TrainingJobs \
+  --log-stream-name-prefix emotion-Elliot \
+  --follow
+
+# Step Functions execution logs
+aws logs tail /aws/stepfunctions/voice-training-pipeline-dev --follow
+
+# Process Upload Lambda logs
+aws logs tail /aws/lambda/ai-training-pipeline-process-upload-dev --follow
+```
+
+**Step Functions Console:**
+1. Navigate to Step Functions in AWS Console
+2. Select `voice-training-pipeline-dev` state machine
+3. View execution history and details
+4. Monitor training pipeline progress in real-time
+
+---
+
+## Component Details
+
+### Training Pipeline (`training_lambda/`)
+
+**Feature Extractor** (`extract.py`)
+- **PoseFeatureExtractor Class**: Comprehensive feature engineering
+- **88 Core Features**:
+  - Postural: Joint angles (9 joints: neck, shoulders, elbows, hips, knees), body proportions (height, width, aspect ratio), keypoint distances (10 critical pairs), symmetry features (left/right balance across 6 pairs)
+  - Kinematic: Velocity features (8 tracked joints), acceleration features (3 key joints), movement distribution (torso, arms, legs)
+  - Temporal: Periodicity via autocorrelation analysis
+  - Global: Bounding box metrics, overall movement magnitude
+- **Robust Handling**: NaN management, confidence thresholding, outlier detection
+
+**Training Script** (`train.py`)
+- **Model**: RandomForest (100 estimators, random_state=42)
+- **Session-Based Training**: Each video = 1 sample (not directory-based)
+- **Pipeline**:
+  1. Load session metadata from `.sessions/` folders
+  2. Group poses by original video source
+  3. Extract 88 features per video session
+  4. Label encoding (LabelEncoder) and feature scaling (StandardScaler)
+  5. Train/test split (80/20, stratified when sample size permits)
+  6. Cross-validation (2-5 fold, adaptive based on sample size)
+  7. Model evaluation with confusion matrix and feature importance
+- **Outputs**: 
+  - `advanced_emotion_model.pkl` (model + scaler + encoder)
+  - `confusion_matrix.png` (normalized confusion matrix visualization)
+  - `feature_importance.png` (top 20 features ranked by importance)
+  - `training_sessions.json` (metadata about training data)
+
+**Minimum Data Requirements:**
+```python
+MIN_SAMPLES_PER_CLASS = 3  # Minimum video sessions per emotion
+MIN_TOTAL_SAMPLES = 10     # Minimum total video sessions
+```
+
+Recommended for Production:
+- 20+ video sessions per emotion class
+- 50+ total video sessions for robust model
+- Multiple recording conditions (lighting, angles, distances)
+
+**SageMaker Wrapper** (`train_sagemaker.py`)
+- **Data Setup**: Reorganizes S3 data structure for training
+- **Error Handling**: Creates fallback minimal model on training failure
+- **Model Validation**: Verifies pickle file integrity before upload
+- **Environment Variables**:
+  - `SM_MODEL_DIR`: Model output directory (`/opt/ml/model`)
+  - `SM_CHANNEL_TRAIN`: Training data input (`/opt/ml/input/data/train`)
+  - `SM_OUTPUT_DATA_DIR`: Additional outputs
+
+**Training Agent** (`handler.py`)
+- **SageMaker Job Creation**: Configures and launches training jobs
+- **Parameters**:
+  - Instance: `ml.m5.large` (2 vCPU, 8 GB RAM)
+  - Max runtime: 7200 seconds (2 hours)
+  - Algorithm: PyTorch CPU training container
+- **Code Packaging**: Creates tarball with all training scripts
+- **Job Naming**: `emotion-{patient_id}-{timestamp}`
+
+---
+
 ## Component Details
 
 ### Video Processing Lambda (`docker/`)
@@ -519,56 +652,57 @@ Feature Engineering:
 
 ## Data Flow
 
-### 1. Video Upload
-```
-User uploads video → S3 event notification → Lambda triggered
-```
+### Training Pipeline
 
-### 2. Video Processing
 ```
-Lambda downloads video
+Pose JSON upload → S3 event notification
   ↓
-Extract audio → Transcribe with Whisper
+Process Upload Lambda triggered
   ↓
-Detect emotions from keywords
+Validate training data:
+  - Check file count (≥10 total pose files)
+  - Check data size (≥5 MB)
+  - Check emotion coverage (≥2 emotions with ≥3 sessions each)
+  - Check training cooldown (prevent duplicate runs within 1 hour)
   ↓
-Extract frames at emotion timestamps
+If validation passes → Trigger Step Functions state machine
   ↓
-Extract poses with MediaPipe
+Step Functions: AnalyzeData state
+  - Evaluate data quality
+  - Determine if training should proceed
   ↓
-Annotate video with overlays
+Step Functions: TrainingDecision state
+  - Branch to either LogTraining or SkipTraining
   ↓
-Upload results to S3 (annotated video, frames, poses)
-```
-
-### 3. Pose Data Organization
-```
-Poses uploaded to training bucket with cumulative indexing:
-  patients999/
-    └── patient-name/
-        └── emotion/
-            ├── pose_000000.json (from session1)
-            ├── pose_000001.json (from session1)
-            ├── pose_000002.json (from session2) ← continues indexing
-            └── .sessions/
-                └── session_metadata.json
-```
-
-### 4. Training Pipeline
-```
-Pose JSON upload → S3 event → Process Upload Lambda
+Step Functions: LogTraining state
+  - Training Agent Lambda creates SageMaker job
+  - Job configuration:
+    * Training data: s3://patients999/{patient_id}/
+    * Output: s3://patients999/models/{patient_id}/
+    * Training script: train_sagemaker.py
+    * Instance: ml.m5.large
   ↓
-Check threshold (file count, size, cooldown)
+SageMaker Training Job:
+  1. Downloads all pose JSONs from patients999 bucket
+  2. Loads session metadata from .sessions/ folders
+  3. Groups poses by original video source
+  4. Extracts 88 features per video session
+  5. Splits into train (80%) and test (20%) sets
+  6. Trains RandomForest classifier
+  7. Generates visualizations (confusion matrix, feature importance)
+  8. Saves model pickle + artifacts
   ↓
-Trigger Step Functions state machine
+Model artifacts uploaded to S3:
+  - s3://patients999/models/{patient_id}/model.tar.gz
+  - Contains:
+    * advanced_emotion_model.pkl
+    * confusion_matrix.png
+    * feature_importance.png
+    * training_sessions.json
   ↓
-Training Agent Lambda creates SageMaker job
-  ↓
-SageMaker downloads pose JSONs
-  ↓
-Extract features, train RandomForest model
-  ↓
-Save model to S3
+Step Functions: UpdateStatus state
+  - Record training completion
+  - Update DynamoDB training history
 ```
 
 ---
